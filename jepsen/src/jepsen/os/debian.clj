@@ -152,13 +152,22 @@
       "deb http://deb.debian.org/debian stretch-backports main")
     (install [:openjdk-11-jdk])))
 
+(defn install-jdk17!
+  "Installs an openjdk jdk17 via stretch-backports."
+  []
+  (c/su
+    (add-repo!
+      "stretch-backports"
+      "deb http://archive.debian.org/debian-security stretch/updates main")
+    (install [:openjdk-17-jdk])))
+
 (deftype Debian []
   os/OS
   (setup! [_ test node]
     (info node "setting up debian")
 
     (setup-hostfile!)
-    (maybe-update!)
+;;     (maybe-update!)
 
     (c/su
       ; Packages!

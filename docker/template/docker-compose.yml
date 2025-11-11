@@ -53,7 +53,10 @@ services:
     depends_on:
 %%DEPS%%
     build: ./control
+    platform: linux/amd64
     env_file: ./secret/control.env
+    cap_add:
+      - ALL
     ports:
       - "22"
       - "8080"

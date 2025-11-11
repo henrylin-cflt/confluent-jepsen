@@ -23,7 +23,11 @@
   (shape! [net test nodes behavior]
           "Shapes network behavior,
           i.e. packet delay, loss, corruption, duplication, reordering, and rate
-          for the given nodes."))
+          for the given nodes.")
+  (shape-from-control! [net test nodes behavior]
+          "Shapes network behavior FROM the control node TO the given db nodes.
+          i.e. packet delay, loss, corruption, duplication, reordering, and rate
+          from control node to target db nodes."))
 
 (defprotocol PartitionAll
   "This optional protocol provides support for making multiple network changes

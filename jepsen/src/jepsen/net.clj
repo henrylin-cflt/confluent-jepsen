@@ -20,7 +20,75 @@
               slow!
               flaky!
               fast!
-              shape!])
+              shape!
+              shape-from-control!])
+
+; Forward declarations for local command execution functions
+(declare run-local-command-with-output run-local-command-safe run-local-command-with-error-output)
+
+; Local command execution functions for control-packet nemesis
+(defn- run-local-command-with-output
+  "Run a command locally without SSH and return the output."
+  [& args]
+  (let [string-args (map str args)
+        pb (java.lang.ProcessBuilder. (into-array String string-args))
+        process (.start pb)
+        reader (java.io.BufferedReader. (java.io.InputStreamReader. (.getInputStream process)))
+        output (->> (line-seq reader)
+                    (doall))
+        exit-code (.waitFor process)]
+    (.close reader)
+    (when-not (zero? exit-code)
+      (throw (RuntimeException. (str "Command failed with exit code " exit-code))))
+    (str/join "\n" output)))
+
+(defn- run-local-command-safe
+  "Run a command locally without SSH, but don't throw on failure."
+  [& args]
+  (let [string-args (map str args)
+        pb (java.lang.ProcessBuilder. (into-array String string-args))
+        process (.start pb)
+        exit-code (.waitFor process)]
+    exit-code))
+
+(defn- run-local-command-with-error-output
+  "Run a command locally without SSH and return both exit code and error output."
+  [& args]
+  (let [string-args (map str args)
+        pb (java.lang.ProcessBuilder. (into-array String string-args))
+        process (.start pb)
+        error-reader (java.io.BufferedReader. (java.io.InputStreamReader. (.getErrorStream process)))
+        error-output (->> (line-seq error-reader)
+                          (doall))
+        exit-code (.waitFor process)]
+    (.close error-reader)
+    {:exit-code exit-code
+     :error-output (str/join "\n" error-output)}))
+
+(defn- get-local-ip
+  "Get the IP address of a hostname locally."
+  [host]
+  (let [output (run-local-command-with-output "getent" "ahostsv4" host)
+        lines (str/split-lines output)
+        first-line (first lines)
+        ip (when first-line
+             (first (str/split first-line #"\s+")))]
+    (cond
+      (and ip (re-find #"^127" ip))
+      (get-local-ip "localhost")
+      (str/blank? ip)
+      (throw (RuntimeException. (str "Blank IP for host: " host)))
+      ip
+      ip
+      :else
+      (throw (RuntimeException. (str "No IP found for host: " host))))))
+
+(defn- delete-local-qdisc
+  "Delete all qdiscs on the given device locally."
+  [dev]
+  (try
+    (run-local-command-with-output "tc" "qdisc" "del" "dev" dev "root")
+    (catch RuntimeException _ nil)))
 
 ; Top-level API functions
 (defn drop-all!
@@ -54,6 +122,25 @@
     (assert iface
             (str "Couldn't determine network interface!\n" choices))
     iface))
+
+(defn- get-local-net-dev
+  "Get the primary network interface locally (for control-packet nemesis)."
+  []
+  (let [devs (->> (run-local-command-with-output "ip" "link" "show")
+                  (str/split-lines)
+                  (map #(re-find #"^\d+: ([^:]+):" %))
+                  (filter some?)
+                  (map second)
+                  (filter #(not (re-find #"^(lo|docker|br-|veth|tunl|gre|sit|ip6tnl|erspan|gretap)" %)))
+                  (filter #(re-find #"^eth" %))  ; Only select eth interfaces
+                  (sort))]
+    (if (seq devs)
+      (let [dev (first devs)]
+        ; Remove @ part from interface name for tc commands
+        (if (re-find #"@" dev)
+          (first (str/split dev #"@"))
+          dev))
+      "eth0")))
 
 (defn qdisc-del
   "Deletes root qdisc for given dev on current node."
@@ -117,6 +204,46 @@
                (concat args [:rate rate])))
            [])))
 
+(defn- hardcoded-netem-params
+  "Returns hardcoded netem parameters for control-packet nemesis."
+  []
+  ["delay" "10000ms" "10ms" "15%" "distribution" "normal"])
+
+(defn- update-netem-delay
+  "Update the delay time of existing netem qdisc on control node."
+  [delay-ms]
+  (info "Updating netem delay to" delay-ms "ms on control node")
+  (try
+    (let [dev (get-local-net-dev)
+          netem-params ["delay" (str delay-ms "ms") "10ms" "15%" "distribution" "normal"]]
+      (info "Updating netem qdisc on device" dev "with new delay:" delay-ms "ms")
+      
+      ; First, check what qdiscs exist
+      (let [qdisc-output (run-local-command-with-output "tc" "qdisc" "show" "dev" dev)]
+        (info "Current qdiscs on" dev ":" qdisc-output))
+      
+      ; Try to find and update the netem qdisc
+      ; Based on the qdisc structure we know: handle "40:" parent "1:4"
+      (let [result (apply run-local-command-with-error-output 
+                         (concat ["tc" "qdisc" "change" "dev" dev "parent" "1:4" "handle" "40:" "netem"] netem-params))]
+        (if (zero? (:exit-code result))
+          (do
+            (info "Successfully updated netem delay to" delay-ms "ms using handle 40: parent 1:4")
+            [:updated delay-ms "40:" "1:4"])
+          (do
+            (warn "Failed to update netem delay on device" dev "- exit code:" (:exit-code result) "- error:" (:error-output result))
+            (warn "Available qdiscs:" (run-local-command-with-output "tc" "qdisc" "show" "dev" dev))
+            [:failed (:error-output result)]))))
+    (catch Exception e
+      (warn e "Error updating netem delay on control node")
+      [:error (.getMessage e)])))
+
+(defn update-control-delay!
+  "Public function to update the delay time of control-packet nemesis.
+  Takes delay in milliseconds and updates the existing netem qdisc."
+  [delay-ms]
+  (update-netem-delay delay-ms))
+
 (defn- net-shape!
   "Shared convenience call for iptables/ipfilter. Shape the network with tc
   qdisc, netem, and filter(s) so target nodes have given behavior."
@@ -161,6 +288,59 @@
       [:shaped   results :netem (vec (behaviors->netem behavior))]
       [:reliable results])))
 
+(defn- net-shape-from-control!
+  "Shape network from control node to target nodes with tc qdisc, netem, and filters."
+  [_net test targets behavior]
+  (info "net-shape-from-control! called with targets:" targets "behavior:" behavior)
+  (let [targets (set targets)]
+    (info "On control node - shaping traffic to targets:" targets)
+    (if (and (seq targets)
+             (seq behavior))
+      ; control node will need a prio qdisc, netem qdisc, and a filter per target
+      (do
+        (info "Creating tc rules on control node for targets" targets)
+        (try
+          ; Run commands directly on the control node without SSH
+          (let [dev (get-local-net-dev)]
+            (info "On control node - shaping traffic to targets:" targets "on dev:" dev)
+            ; start with no qdisc
+            (delete-local-qdisc dev)
+            ; Run commands directly with error handling
+            (let [netem-params (hardcoded-netem-params)]
+              (try
+                ; root prio qdisc, bands 1:1-3 are system default prio
+                (let [exit-code (run-local-command-safe "tc" "qdisc" "add" "dev" dev "root" "handle" "1:" "prio" "bands" "4" "priomap" "1" "2" "2" "2" "1" "2" "0" "0" "1" "1" "1" "1" "1" "1" "1" "1")]
+                  (when-not (zero? exit-code)
+                    (warn "Failed to create root qdisc on device" dev "- tc may not be supported on this interface")))
+                ; band 1:4 is a netem qdisc for the behavior
+                (let [result (apply run-local-command-with-error-output (concat ["tc" "qdisc" "add" "dev" dev "parent" "1:4" "handle" "40:" "netem"] netem-params))]
+                  (when-not (zero? (:exit-code result))
+                    (warn "Failed to create netem qdisc on device" dev "- exit code:" (:exit-code result) "- error:" (:error-output result) "- params:" netem-params)))
+                ; filter dst ip's to netem qdisc with behavior
+                (doseq [target targets]
+                  (let [target-ip (get-local-ip target)]
+                    (info "Adding filter for target" target "with IP" target-ip)
+                    (let [result (run-local-command-with-error-output "tc" "filter" "add" "dev" dev "parent" "1:0" "protocol" "ip" "prio" "3" "u32" "match" "ip" "dst" target-ip "flowid" "1:4")]
+                      (when-not (zero? (:exit-code result))
+                        (warn "Failed to create filter for target" target "on device" dev "- exit code:" (:exit-code result) "- error:" (:error-output result))))))
+              (catch Exception e
+                (warn e "Error creating tc rules on device" dev "- tc may not be supported on this interface"))))
+            (info "TC rules created successfully on control node")
+            [:shaped targets :netem (vec (behaviors->netem behavior))])
+          (catch Exception e
+            (warn e "Failed to create tc rules on control node")
+            (throw e))))
+      ; no targets and/or behavior, so clean up existing qdisc/netem/filters
+      (do
+        (info "Cleaning up tc rules on control node - empty targets or behavior")
+        (try
+          (let [dev (get-local-net-dev)]
+            (delete-local-qdisc dev)
+            (info "Cleaned up tc rules on control node"))
+          (catch Exception e
+            (warn e "Failed to clean up tc rules on control node")))
+        [:reliable nil]))))
+
 (def noop
   "Does nothing."
   (reify Net
@@ -170,7 +350,9 @@
     (slow!  [net test opts])
     (flaky! [net test])
     (fast!  [net test])
-    (shape! [net test nodes behavior])))
+    (shape! [net test nodes behavior])
+
+    (shape-from-control! [net test targets behavior])))
 
 (def iptables
   "Default iptables (assumes we control everything)."
@@ -220,6 +402,9 @@
     (shape! [net test nodes behavior]
       (net-shape! net test nodes behavior))
 
+    (shape-from-control! [net test targets behavior]
+      (net-shape-from-control! net test targets behavior))
+
     PartitionAll
     (drop-all! [net test grudge]
       (on-nodes test
@@ -267,4 +452,7 @@
         (su (exec :tc :qdisc :del :dev :eth0 :root))))
 
     (shape! [net test nodes behavior]
-      (net-shape! net test nodes behavior))))
+      (net-shape! net test nodes behavior))
+
+    (shape-from-control! [net test targets behavior]
+      (net-shape-from-control! net test targets behavior))))

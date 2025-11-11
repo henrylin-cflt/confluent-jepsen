@@ -2491,19 +2491,21 @@
             bad-error-types (->> (keys errors)
                                  (remove (allowed-error-types test))
                                  sort)
+            ; avoid render plots which could takes hours to generate
             ; Render plots
-            order-viz-task (h/task history order-viz []
-                                   (render-order-viz! test analysis))
-            plot-unseen-task (h/task history plot-unseen []
-                                     (plot-unseen! test unseen opts))
-            plot-realtime-lags-task (h/task history plot-realtime-lags []
-                                            (plot-realtime-lags!
-                                              test realtime-lag opts))]
+            ;; order-viz-task (h/task history order-viz []
+            ;;                        (render-order-viz! test analysis))
+            ;; plot-unseen-task (h/task history plot-unseen []
+            ;;                          (plot-unseen! test unseen opts))
+            ;; plot-realtime-lags-task (h/task history plot-realtime-lags []
+            ;;                                 (plot-realtime-lags!
+            ;;                                   test realtime-lag opts))
+                                              ]
         ; Block on tasks
         @consume-counts-task
-        @order-viz-task
-        @plot-unseen-task
-        @plot-realtime-lags-task
+;;         @order-viz-task
+;;         @plot-unseen-task
+;;         @plot-realtime-lags-task
 
         ; Construct results
         (->> errors
